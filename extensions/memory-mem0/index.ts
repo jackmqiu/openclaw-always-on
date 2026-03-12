@@ -8,6 +8,7 @@ type MemoryHookContext = {
   agentId?: string;
   sessionKey?: string;
   sessionId?: string;
+  messageProvider?: string;
 };
 
 type Mem0Message = {
@@ -22,6 +23,16 @@ type Mem0SearchItem = {
   metadata?: Record<string, unknown>;
   createdAt?: string;
   updatedAt?: string;
+};
+
+type ConversationIdentity = {
+  entityKey: string;
+  sessionRest?: string;
+  channel?: string;
+  chatType?: string;
+  peerId?: string;
+  accountId?: string;
+  threadId?: string;
 };
 
 type Mem0TelemetryEntry = {
@@ -122,7 +133,28 @@ function sanitizeForPrompt(text: string): string {
     .replaceAll("'", "&#39;");
 }
 
-function formatMemoriesForPrompt(items: Mem0SearchItem[]): string {
+function formatConversationContext(metadata: Record<string, unknown>): string {
+  const parts: string[] = [];
+  const append = (key: string, value: unknown) => {
+    if (typeof value !== "string") {
+      return;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return;
+    }
+    parts.push(`${key}=${trimmed}`);
+  };
+  append("entity", metadata.conversationEntityKey);
+  append("channel", metadata.conversationChannel);
+  append("chat", metadata.conversationChatType);
+  append("peer", metadata.conversationPeerId);
+  append("account", metadata.conversationAccountId);
+  append("thread", metadata.conversationThreadId);
+  return parts.join(", ");
+}
+
+export function formatMemoriesForPrompt(items: Mem0SearchItem[]): string {
   const lines = items
     .filter((item) => Boolean(item.memory?.trim()))
     .map((item, index) => {
@@ -130,7 +162,10 @@ function formatMemoriesForPrompt(items: Mem0SearchItem[]): string {
         typeof item.score === "number" && Number.isFinite(item.score)
           ? ` (score ${(item.score * 100).toFixed(0)}%)`
           : "";
-      return `${index + 1}. [id:${item.id}] ${sanitizeForPrompt(item.memory)}${score}`;
+      const metadata = asObject(item.metadata);
+      const context = formatConversationContext(metadata);
+      const contextPart = context ? ` [context: ${sanitizeForPrompt(context)}]` : "";
+      return `${index + 1}. [id:${item.id}]${contextPart} ${sanitizeForPrompt(item.memory)}${score}`;
     });
   if (lines.length === 0) {
     return "";
@@ -217,12 +252,192 @@ function normalizeUserId(value: string): string {
   return cleaned || "unknown";
 }
 
+function normalizeMetaValue(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const cleaned = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w:\-./]+/g, "_");
+  return cleaned || undefined;
+}
+
+export function deriveConversationIdentityFromSessionKey(
+  sessionKey?: string,
+): ConversationIdentity | null {
+  const raw = sessionKey?.trim();
+  if (!raw) {
+    return null;
+  }
+  const parts = raw.split(":").filter(Boolean);
+  if (parts.length < 3 || parts[0] !== "agent") {
+    return null;
+  }
+
+  const restParts = parts
+    .slice(2)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (restParts.length === 0) {
+    return null;
+  }
+
+  let threadId: string | undefined;
+  for (let i = restParts.length - 2; i >= 0; i -= 1) {
+    const marker = restParts[i]?.toLowerCase();
+    if (marker === "thread" || marker === "topic") {
+      threadId = normalizeMetaValue(restParts[i + 1]);
+      restParts.splice(i, 2);
+      break;
+    }
+  }
+
+  const normalizedRestParts = restParts.map((part) => part.toLowerCase());
+  const rest = normalizedRestParts.join(":");
+  const first = normalizedRestParts[0];
+  const second = normalizedRestParts[1];
+  const third = normalizedRestParts[2];
+  const fourth = normalizedRestParts[3];
+
+  let channel: string | undefined;
+  let chatType: string | undefined;
+  let peerId: string | undefined;
+  let accountId: string | undefined;
+
+  if (normalizedRestParts.length === 1 && first === "main") {
+    chatType = "main";
+  } else if (normalizedRestParts.length >= 2 && first === "direct") {
+    chatType = "direct";
+    peerId = normalizeMetaValue(second);
+  } else if (
+    normalizedRestParts.length >= 3 &&
+    (second === "direct" || second === "group" || second === "channel")
+  ) {
+    channel = normalizeMetaValue(first);
+    chatType = second;
+    peerId = normalizeMetaValue(third);
+  } else if (normalizedRestParts.length >= 4 && third === "direct") {
+    channel = normalizeMetaValue(first);
+    accountId = normalizeMetaValue(second);
+    chatType = "direct";
+    peerId = normalizeMetaValue(fourth);
+  }
+
+  const entityKey = normalizeUserId(
+    [
+      channel ?? "session",
+      accountId ?? "",
+      chatType ?? "unknown",
+      peerId ?? "unknown",
+      threadId ?? "",
+    ]
+      .filter(Boolean)
+      .join(":"),
+  );
+
+  return {
+    entityKey,
+    sessionRest: rest || undefined,
+    channel,
+    chatType,
+    peerId,
+    accountId,
+    threadId,
+  };
+}
+
 function resolveUserId(config: ResolvedMem0PluginConfig, ctx: MemoryHookContext): string {
   let userId = config.userIdTemplate;
   userId = replaceToken(userId, "agentId", ctx.agentId);
   userId = replaceToken(userId, "sessionKey", ctx.sessionKey);
   userId = replaceToken(userId, "sessionId", ctx.sessionId);
   return normalizeUserId(userId);
+}
+
+function buildConversationMetadata(ctx: MemoryHookContext): Record<string, unknown> {
+  const identity = deriveConversationIdentityFromSessionKey(ctx.sessionKey);
+  if (!identity) {
+    return {};
+  }
+  return {
+    conversationEntityKey: identity.entityKey,
+    conversationSessionRest: identity.sessionRest,
+    conversationChannel: identity.channel,
+    conversationChatType: identity.chatType,
+    conversationPeerId: identity.peerId,
+    conversationAccountId: identity.accountId,
+    conversationThreadId: identity.threadId,
+    messageProvider: ctx.messageProvider,
+  };
+}
+
+function scoreConversationMatch(
+  metadata: Record<string, unknown>,
+  identity: ConversationIdentity | null,
+): number {
+  if (!identity) {
+    return 0;
+  }
+  let score = 0;
+  if (
+    identity.entityKey &&
+    typeof metadata.conversationEntityKey === "string" &&
+    metadata.conversationEntityKey === identity.entityKey
+  ) {
+    score += 100;
+  }
+  if (
+    identity.peerId &&
+    typeof metadata.conversationPeerId === "string" &&
+    metadata.conversationPeerId === identity.peerId
+  ) {
+    score += 40;
+  }
+  if (
+    identity.channel &&
+    typeof metadata.conversationChannel === "string" &&
+    metadata.conversationChannel === identity.channel
+  ) {
+    score += 20;
+  }
+  if (
+    identity.chatType &&
+    typeof metadata.conversationChatType === "string" &&
+    metadata.conversationChatType === identity.chatType
+  ) {
+    score += 12;
+  }
+  if (
+    identity.accountId &&
+    typeof metadata.conversationAccountId === "string" &&
+    metadata.conversationAccountId === identity.accountId
+  ) {
+    score += 8;
+  }
+  return score;
+}
+
+export function rankMemoriesByConversationContext(
+  items: Mem0SearchItem[],
+  sessionKey?: string,
+): Mem0SearchItem[] {
+  const identity = deriveConversationIdentityFromSessionKey(sessionKey);
+  if (!identity) {
+    return items;
+  }
+  return [...items].sort((a, b) => {
+    const aMeta = asObject(a.metadata);
+    const bMeta = asObject(b.metadata);
+    const aContextScore = scoreConversationMatch(aMeta, identity);
+    const bContextScore = scoreConversationMatch(bMeta, identity);
+    if (aContextScore !== bContextScore) {
+      return bContextScore - aContextScore;
+    }
+    const aBase = typeof a.score === "number" ? a.score : -Infinity;
+    const bBase = typeof b.score === "number" ? b.score : -Infinity;
+    return bBase - aBase;
+  });
 }
 
 function parseMemoryId(rawId: string): string {
@@ -494,6 +709,7 @@ const memoryPlugin = {
           const hookCtx: MemoryHookContext = {
             agentId: ctx.agentId,
             sessionKey: ctx.sessionKey,
+            messageProvider: ctx.messageChannel,
           };
           const userId = resolveUserId(config, hookCtx);
           const limit =
@@ -505,12 +721,15 @@ const memoryPlugin = {
               ? Math.max(0, Math.min(1, params.minScore))
               : config.recallMinScore;
           try {
-            const results = await client.search({
-              query,
-              userId,
-              limit,
-              minScore,
-            });
+            const results = rankMemoriesByConversationContext(
+              await client.search({
+                query,
+                userId,
+                limit,
+                minScore,
+              }),
+              ctx.sessionKey,
+            );
             return {
               content: [
                 {
@@ -620,6 +839,7 @@ const memoryPlugin = {
           const hookCtx: MemoryHookContext = {
             agentId: ctx.agentId,
             sessionKey: ctx.sessionKey,
+            messageProvider: ctx.messageChannel,
           };
           const userId = resolveUserId(config, hookCtx);
           try {
@@ -627,6 +847,7 @@ const memoryPlugin = {
               source: "memory_store_tool",
               agentId: ctx.agentId ?? "unknown",
               sessionKey: ctx.sessionKey ?? "unknown",
+              ...buildConversationMetadata(hookCtx),
             });
             return {
               content: [{ type: "text", text: "Stored in Mem0." }],
@@ -787,12 +1008,15 @@ const memoryPlugin = {
         }
         const userId = resolveUserId(config, ctx);
         try {
-          const results = await client.search({
-            query,
-            userId,
-            limit: config.recallLimit,
-            minScore: config.recallMinScore,
-          });
+          const results = rankMemoriesByConversationContext(
+            await client.search({
+              query,
+              userId,
+              limit: config.recallLimit,
+              minScore: config.recallMinScore,
+            }),
+            ctx.sessionKey,
+          );
           if (results.length === 0) {
             return;
           }
@@ -830,6 +1054,7 @@ const memoryPlugin = {
             agentId: ctx.agentId ?? "unknown",
             sessionKey: ctx.sessionKey ?? "unknown",
             sessionId: ctx.sessionId ?? "unknown",
+            ...buildConversationMetadata(ctx),
           });
         } catch (err) {
           api.logger.warn(`memory-mem0: auto-capture failed: ${String(err)}`);

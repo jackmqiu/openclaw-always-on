@@ -174,6 +174,26 @@ function buildVoiceSection(params: { isMinimal: boolean; ttsHint?: string }) {
   return ["## Voice (TTS)", hint, ""];
 }
 
+function buildAlwaysOnSection(isMinimal: boolean) {
+  if (isMinimal) {
+    return [];
+  }
+  return [
+    "## Always-On Operating Loop",
+    "Maintain explicit operating state in `memory/always-on-state.json` with mode: sleeping | working | researching.",
+    "Keep `memory/priorities.md` (ranked priorities) and `memory/trails/` (active work trails).",
+    "On heartbeat/proactive turns: decide mode first, then act, then update state files.",
+    "Mode guidance:",
+    "- sleeping: only urgent checks/actions; otherwise reply HEARTBEAT_OK.",
+    "- researching: gather information, capture findings, and convert to a concrete trail when ready.",
+    "- working: every cycle must do exactly one branch:",
+    "  A) Follow trail: advance the next concrete step from the active trail.",
+    "  B) Priorities check-back: review priorities, select the top item, then start/refresh the active trail.",
+    "Never stay in working mode without choosing either trail-following or priorities check-back.",
+    "",
+  ];
+}
+
 function buildDocsSection(params: { docsPath?: string; isMinimal: boolean; readToolName: string }) {
   const docsPath = params.docsPath?.trim();
   if (!docsPath || params.isMinimal) {
@@ -569,6 +589,7 @@ export function buildAgentSystemPrompt(params: {
       runtimeChannel,
       messageToolHints: params.messageToolHints,
     }),
+    ...buildAlwaysOnSection(isMinimal),
     ...buildVoiceSection({ isMinimal, ttsHint: params.ttsHint }),
   ];
 
